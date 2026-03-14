@@ -1,0 +1,32 @@
+model:
+  name: "rubert-sentiment"
+  pretrained_model: "DeepPavlov/rubert-base-cased"
+  num_labels: 3
+
+training:
+  batch_size: 16
+  epochs: 3
+  learning_rate: 2e-5
+  max_length: 128
+  seed: 42
+  test_size: 0.2
+  use_dummy_data: true
+
+paths:
+  data_raw: "data/raw"
+  data_processed: "data/processed"
+  models: "models"
+  logs: "logs"
+
+cloud:
+  s3_bucket: "sentiment-analysis-bucket"
+  s3_region: "ru-msk"
+  s3_endpoint: "https://hb.ru-msk.vkcloud-storage.ru"
+  s3_model_prefix: "models/rubert_sentiment_model"
+
+deployment:
+  vm_os: "Ubuntu 22.04"
+  vm_flavor: "STD2-2-4"
+  disk_type: "SSD"
+  disk_size_gb: 30
+  public_ip: true

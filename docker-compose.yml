@@ -1,0 +1,9 @@
+services:
+  api:
+    build: .
+    container_name: rubert-sentiment-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"

@@ -1,0 +1,11 @@
+torch
+transformers
+scikit-learn
+pandas
+numpy
+fastapi
+uvicorn
+s3fs
+boto3
+python-dotenv
+PyYAML
