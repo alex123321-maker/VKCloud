@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -39,6 +40,12 @@ _INDEX_HTML = """<!DOCTYPE html>
   }
   h1 { font-size: 1.5rem; margin-bottom: 8px; }
   .subtitle { color: #666; font-size: .9rem; margin-bottom: 24px; }
+  .field-label { display: block; margin-bottom: 8px; color: #444; font-size: .9rem; }
+  select {
+    width: 100%; margin-bottom: 14px; padding: 10px 12px; font-size: .95rem;
+    border: 1px solid #ddd; border-radius: 8px; background: #fff;
+  }
+  select:focus { outline: none; border-color: #4a90d9; }
   textarea {
     width: 100%; min-height: 120px; padding: 12px; font-size: 1rem;
     border: 1px solid #ddd; border-radius: 8px; resize: vertical;
@@ -71,6 +78,8 @@ _INDEX_HTML = """<!DOCTYPE html>
   <h1>Анализ тональности текста</h1>
   <p class="subtitle">Введите отзыв на русском языке, и модель определит его тональность (позитивный / нейтральный / негативный).</p>
 
+  <label class="field-label" for="modelSelect">Модель</label>
+  <select id="modelSelect"></select>
   <textarea id="inputText" placeholder="Напишите отзыв здесь..."></textarea>
   <button class="btn" id="analyzeBtn" onclick="analyze()">Анализировать</button>
 
@@ -88,8 +97,37 @@ const SENTIMENT_RU = {
   unknown:  "Неизвестно"
 };
 
+async function loadModels() {
+  const modelSelect = document.getElementById("modelSelect");
+  try {
+    const resp = await fetch("/models");
+    if (!resp.ok) throw new Error("Не удалось получить список моделей");
+    const data = await resp.json();
+
+    modelSelect.innerHTML = "";
+    for (const modelName of data.models || []) {
+      const option = document.createElement("option");
+      option.value = modelName;
+      option.textContent = modelName;
+      modelSelect.appendChild(option);
+    }
+
+    if (data.default_model) {
+      modelSelect.value = data.default_model;
+    }
+  } catch (e) {
+    modelSelect.innerHTML = "";
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Нет доступных моделей";
+    modelSelect.appendChild(option);
+    modelSelect.disabled = true;
+  }
+}
+
 async function analyze() {
   const text = document.getElementById("inputText").value.trim();
+  const selectedModel = document.getElementById("modelSelect").value;
   if (!text) return;
 
   const btn = document.getElementById("analyzeBtn");
@@ -105,7 +143,7 @@ async function analyze() {
     const resp = await fetch("/predict", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({text: text})
+      body: JSON.stringify({text: text, model: selectedModel})
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
@@ -115,7 +153,7 @@ async function analyze() {
     const cls = data.sentiment || "unknown";
     resultDiv.className = "result " + cls;
     sentimentLabel.textContent = SENTIMENT_RU[cls] || cls;
-    confidenceLabel.textContent = "Уверенность модели: " + (data.confidence * 100).toFixed(1) + "%";
+    confidenceLabel.textContent = "Модель: " + data.model + " • Уверенность: " + (data.confidence * 100).toFixed(1) + "%";
     resultDiv.style.display = "block";
   } catch (e) {
     resultDiv.className = "result error";
@@ -132,16 +170,21 @@ async function analyze() {
 document.getElementById("inputText").addEventListener("keydown", function(e) {
   if (e.ctrlKey && e.key === "Enter") analyze();
 });
+
+loadModels();
 </script>
 </body>
 </html>
 """
 
 MODEL_PATH = Path(os.getenv("MODEL_PATH", "models/rubert_sentiment_model"))
+MODELS_ROOT = Path(os.getenv("MODELS_ROOT", str(MODEL_PATH.parent)))
+DEFAULT_MODEL_NAME = os.getenv("DEFAULT_MODEL_NAME", MODEL_PATH.name)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = None
-tokenizer = None
-inv_label_map = {}
+available_models: Dict[str, Path] = {}
+loaded_models: Dict[
+    str, Tuple[AutoModelForSequenceClassification, AutoTokenizer, Dict[int, str]]
+] = {}
 
 
 def ensure_local_model() -> None:
@@ -160,32 +203,61 @@ def ensure_local_model() -> None:
     download_prefix(bucket, prefix, str(MODEL_PATH))
 
 
-def load_model() -> None:
-    global model, tokenizer, inv_label_map
+def discover_models() -> None:
+    global available_models
 
-    ensure_local_model()
+    models: Dict[str, Path] = {}
 
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-        model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
-        model.to(device)
-        model.eval()
+    if MODELS_ROOT.exists():
+        for path in MODELS_ROOT.iterdir():
+            if path.is_dir() and (path / "config.json").exists():
+                models[path.name] = path
 
-        label_map_path = MODEL_PATH / "label_map.json"
-        if label_map_path.exists():
-            with open(label_map_path, "r", encoding="utf-8") as file:
-                label_map = json.load(file)
-            inv_label_map = {int(value): key for key, value in label_map.items()}
+    if MODEL_PATH.exists() and (MODEL_PATH / "config.json").exists():
+        models.setdefault(DEFAULT_MODEL_NAME, MODEL_PATH)
 
-        logger.info("Модель успешно загружена")
-    except Exception as exc:
-        logger.error("Не удалось загрузить модель: %s", exc)
-        model = None
-        tokenizer = None
-        inv_label_map = {}
+    if not models:
+        ensure_local_model()
+        if MODEL_PATH.exists() and (MODEL_PATH / "config.json").exists():
+            models.setdefault(DEFAULT_MODEL_NAME, MODEL_PATH)
+
+    available_models = dict(sorted(models.items()))
 
 
-load_model()
+def get_default_model_name() -> Optional[str]:
+    if DEFAULT_MODEL_NAME in available_models:
+        return DEFAULT_MODEL_NAME
+    return next(iter(available_models), None)
+
+
+def load_model(
+    model_name: str,
+) -> Tuple[AutoModelForSequenceClassification, AutoTokenizer, Dict[int, str]]:
+    if model_name in loaded_models:
+        return loaded_models[model_name]
+
+    model_path = available_models.get(model_name)
+    if model_path is None:
+        raise ValueError(f"Модель '{model_name}' не найдена")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForSequenceClassification.from_pretrained(model_path)
+    model.to(device)
+    model.eval()
+
+    inv_label_map: Dict[int, str] = {}
+    label_map_path = model_path / "label_map.json"
+    if label_map_path.exists():
+        with open(label_map_path, "r", encoding="utf-8") as file:
+            label_map = json.load(file)
+        inv_label_map = {int(value): key for key, value in label_map.items()}
+
+    loaded_models[model_name] = (model, tokenizer, inv_label_map)
+    logger.info("Модель '%s' успешно загружена", model_name)
+    return loaded_models[model_name]
+
+
+discover_models()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -196,18 +268,50 @@ async def index():
 
 class TextRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=5000)
+    model: Optional[str] = None
 
 
 class SentimentResponse(BaseModel):
     text: str
     sentiment: str
     confidence: float
+    model: str
+
+
+class ModelsResponse(BaseModel):
+    models: list[str]
+    default_model: Optional[str]
+
+
+@app.get("/models", response_model=ModelsResponse)
+async def list_models():
+    discover_models()
+    return ModelsResponse(
+        models=list(available_models.keys()),
+        default_model=get_default_model_name(),
+    )
 
 
 @app.post("/predict", response_model=SentimentResponse)
 async def predict(request: TextRequest):
-    if model is None or tokenizer is None:
-        raise HTTPException(status_code=500, detail="Модель не загружена")
+    discover_models()
+
+    model_name = request.model or get_default_model_name()
+    if model_name is None:
+        raise HTTPException(status_code=500, detail="Нет доступных моделей")
+    if model_name not in available_models:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Модель '{model_name}' не найдена. Доступные модели: {', '.join(available_models.keys())}",
+        )
+
+    try:
+        model, tokenizer, inv_label_map = load_model(model_name)
+    except Exception as exc:
+        logger.error("Не удалось загрузить модель '%s': %s", model_name, exc)
+        raise HTTPException(
+            status_code=500, detail=f"Не удалось загрузить модель '{model_name}'"
+        ) from exc
 
     inputs = tokenizer(
         request.text,
@@ -229,12 +333,18 @@ async def predict(request: TextRequest):
         text=request.text,
         sentiment=sentiment,
         confidence=confidence,
+        model=model_name,
     )
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "model_loaded": model is not None, "device": str(device)}
+    return {
+        "status": "ok",
+        "available_models": list(available_models.keys()),
+        "loaded_models": list(loaded_models.keys()),
+        "device": str(device),
+    }
 
 
 if __name__ == "__main__":
